@@ -1,0 +1,30 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+
+# Editors and OS
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# Secrets: the RPC URL and API keys. Never commit or share them.
+.env
+.env.*
+!.env.example
+
+# Your data. The store, the reports and the address files list your
+# addresses and income, so keep them local.
+data/
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.csv
+*.txt
+!requirements.txt
