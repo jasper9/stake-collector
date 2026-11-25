@@ -32,11 +32,16 @@ st = load_stake_tips()
 # Real mainnet values, checked with solders' find_program_address (2026-11-13).
 VOTE = "gaToR246dheK1DGAMEqxMdBJZwU4qFyt7DzhSwAHFWF"
 TDA_1084 = "GcfpobKMNhaZL2C3n8GqjxHWnHpuQZC3GhTZ1FZ11cye"
+# A Priority Fee Distribution account seen in a mainnet claim (2026-11-24),
+# for a validator that shares its priority fees through Jito.
+PF_VOTE = "DMSuZcavta8L1w1tSiH8bALWjz6Q6KSryGG6m6Az4Qt5"
+PF_ACCOUNT_1095 = "5pdyVTDuQko5P9i2ommjgdecX2gUxN4AJh4ZjBvTdyXe"
 
 STAKE = st.b58encode(bytes([7]) * 32)
 OTHER_STAKE = st.b58encode(bytes([8]) * 32)
 PAYER = st.b58encode(bytes([9]) * 32)
 TDP = st.TIP_DISTRIBUTION_PROGRAM
+PFP = st.PRIO_FEE_DISTRIBUTION_PROGRAM
 ROUTER = "RouterBmuRBkPUbgEDMtdvTZ75GBdSREZR5uGUxxxpb"
 BONDS = "vBoNdEvzMrSai7is21XgVYik65mqtaKXuSdMBJ1xkW4"
 SYSTEM = "11111111111111111111111111111111"
@@ -105,6 +110,18 @@ def tip_tx(amount=12345, tda=TDA_1084, claimant=STAKE, block_time=1794540000):
     )
 
 
+def pf_tx(amount=678, claimant=STAKE, block_time=1794540000):
+    """A priority-fee claim: the same Router call and event, another program."""
+    pda = st.distribution_account(PFP, VOTE, 1084)
+    return make_tx(
+        amount,
+        [{"programId": ROUTER, "accounts": []}],
+        inner=[{"programId": PFP, "accounts": []}],
+        logs=claim_logs(claim_event(pda, claimant, amount), emitter=PFP),
+        block_time=block_time,
+    )
+
+
 def stake_ix(kind, **info):
     return {"programId": st.STAKE_PROGRAM, "parsed": {"type": kind, "info": info}}
 
@@ -122,6 +139,9 @@ class TestBase58AndPda(unittest.TestCase):
 
     def test_tip_distribution_account_matches_mainnet(self):
         self.assertEqual(st.tip_distribution_account(VOTE, 1084), TDA_1084)
+
+    def test_prio_fee_distribution_account_matches_mainnet(self):
+        self.assertEqual(st.distribution_account(PFP, PF_VOTE, 1095), PF_ACCOUNT_1095)
 
     def test_pda_is_off_curve_and_wallet_key_is_on_curve(self):
         self.assertFalse(st.is_on_curve(st.b58decode(TDA_1084)))
@@ -143,6 +163,22 @@ class TestDecodeClaimEvents(unittest.TestCase):
         claims = st.decode_claim_events(claim_logs(claim_event(TDA_1084, STAKE, 42)))
         self.assertEqual(claims, [st.Claim(TDA_1084, STAKE, 42)])
 
+    def test_decodes_event_from_prio_fee_program(self):
+        logs = claim_logs(claim_event(PF_ACCOUNT_1095, STAKE, 42), emitter=PFP)
+        (claim,) = st.decode_claim_events(logs)
+        self.assertEqual(claim, st.Claim(PF_ACCOUNT_1095, STAKE, 42, PFP))
+        self.assertEqual(claim.income_type, "jito_prio_fee")
+
+    def test_tip_and_prio_fee_events_keep_their_program(self):
+        logs = claim_logs(claim_event(TDA_1084, STAKE, 1))
+        logs[-1:-1] = [
+            f"Program {PFP} invoke [2]",
+            claim_event(PF_ACCOUNT_1095, STAKE, 2),
+            f"Program {PFP} success",
+        ]
+        types = [c.income_type for c in st.decode_claim_events(logs)]
+        self.assertEqual(types, ["jito_tip", "jito_prio_fee"])
+
     def test_ignores_same_bytes_from_another_program(self):
         logs = claim_logs(claim_event(TDA_1084, STAKE, 42), emitter=BONDS)
         self.assertEqual(st.decode_claim_events(logs), [])
@@ -156,7 +192,7 @@ class TestDecodeClaimEvents(unittest.TestCase):
 class TestClassify(unittest.TestCase):
     def test_jito_tip(self):
         result = st.classify(tip_tx(12345), STAKE)
-        self.assertEqual(result.kind, st.INCOME_JITO_TIP)
+        self.assertEqual(result.kind, st.KIND_JITO_CLAIM)
         self.assertEqual((result.tip, result.delta), (12345, 12345))
         self.assertEqual(result.tip_accounts, [TDA_1084])
 
@@ -168,13 +204,20 @@ class TestClassify(unittest.TestCase):
         )
         result = st.classify(tx, STAKE)
         self.assertEqual(
-            (result.kind, result.tip, result.other), ("jito_tip", 12345, 500)
+            (result.kind, result.tip, result.other), ("jito_claim", 12345, 500)
         )
         self.assertEqual(result.label, "jito_router+system_transfer")
 
+    def test_prio_fee_claim_is_a_jito_claim(self):
+        result = st.classify(pf_tx(678), STAKE)
+        self.assertEqual(
+            (result.kind, result.tip, result.other), ("jito_claim", 678, 0)
+        )
+        self.assertEqual([c.program for c in result.claims], [PFP])
+
     def test_claim_for_another_claimant_is_not_our_tip(self):
         tx = tip_tx(12345, claimant=OTHER_STAKE)
-        self.assertNotEqual(st.classify(tx, STAKE).kind, st.INCOME_JITO_TIP)
+        self.assertNotEqual(st.classify(tx, STAKE).kind, st.KIND_JITO_CLAIM)
 
     def test_owner_stake_move_is_not_income(self):
         tx = make_tx(500, [stake_ix("merge", destination=STAKE, source=OTHER_STAKE)])
@@ -478,7 +521,7 @@ class StoreTestCase(unittest.TestCase):
     def report(self, period, now=1_000_000, refresh=False, rpc=None):
         rpc = rpc or self.rpc
         st.ensure_synced(rpc, self.store, STAKE, MAINNET, period, refresh, now)
-        return st.collect_jito_tips(rpc, self.store, [STAKE], period, MAINNET)
+        return st.collect_jito_claims(rpc, self.store, [STAKE], period, MAINNET)
 
 
 class TestReportSync(StoreTestCase):
@@ -554,6 +597,34 @@ class TestReportSync(StoreTestCase):
         rows = [(r.tip_epoch, r.lamports) for r in report.rows]
         self.assertEqual(rows, [(1083, 7), (1084, 12345)])
         self.assertEqual(report.tip_mismatches, [])
+
+    def test_prio_fee_claim_has_its_own_type_epoch_and_program(self):
+        self.rpc.transactions["tip-1085"] = pf_tx(678)
+        report = self.report(st.Period(epoch=1085))
+        (row,) = report.rows
+        self.assertEqual(
+            (row.income_type, row.tip_epoch, row.lamports, row.distribution_program),
+            ("jito_prio_fee", 1084, 678, PFP),
+        )
+        self.assertNotIn("tip-1085", [r.signature for r in report.other_increases])
+
+    def test_tip_and_prio_fee_in_one_transaction_are_two_rows(self):
+        tx = self.rpc.transactions["tip-1085"]
+        pda = st.distribution_account(PFP, VOTE, 1084)
+        tx["meta"]["logMessages"][-1:-1] = [
+            f"Program {PFP} invoke [2]",
+            claim_event(pda, STAKE, 678),
+            f"Program {PFP} success",
+        ]
+        tx["meta"]["postBalances"][1] += 678
+        report = self.report(st.Period(epoch=1085))
+        rows = [(r.income_type, r.tip_epoch, r.lamports) for r in report.rows]
+        self.assertEqual(
+            rows, [("jito_tip", 1084, 12345), ("jito_prio_fee", 1084, 678)]
+        )
+        self.assertEqual(report.tip_mismatches, [])
+        others = [r.signature for r in report.other_increases]
+        self.assertNotIn("tip-1085", others)
 
     def test_second_run_makes_no_rpc_calls(self):
         self.report(st.Period(epoch=1085))
@@ -692,7 +763,7 @@ class TestSyncAndOffline(StoreTestCase):
         self.assertIsNone(report.rows[0].tip_epoch)
         self.rpc.voter = VOTE
         st.ensure_synced(self.rpc, self.store, STAKE, MAINNET, st.Period(), True, 2)
-        report = st.collect_jito_tips(
+        report = st.collect_jito_claims(
             self.rpc, self.store, [STAKE], st.Period(epoch=1085), MAINNET, True
         )
         self.assertEqual(report.rows[0].tip_epoch, 1084)
@@ -1099,11 +1170,13 @@ class TestOutput(unittest.TestCase):
         out = io.StringIO()
         st.write_csv(out, [self.row(12345, price=Decimal("80"))], usd=True)
         header, line = out.getvalue().splitlines()
-        self.assertEqual(header.split(","), st.CSV_FIELDS + st.CSV_USD_FIELDS)
+        self.assertEqual(
+            header.split(","), st.CSV_FIELDS + st.CSV_USD_FIELDS + st.CSV_TAIL_FIELDS
+        )
         self.assertEqual(
             line,
             f"{STAKE},1085,1084,468750000,2026-11-13 03:20:00,0.000012345,jito_tip,"
-            "sig,80,0.000988,",
+            "sig,80,0.000988,,",
         )
 
     def test_usd_total_sums_unrounded_values(self):
@@ -1112,7 +1185,31 @@ class TestOutput(unittest.TestCase):
         self.assertEqual(st.usd_value(rows[0]), Decimal("0.000000"))
         out = io.StringIO()
         st.write_summary(out, st.Report(rows=rows), [STAKE], st.Period(), usd=True)
-        self.assertIn("TOTAL  0.000080000 SOL  $0.01", out.getvalue())
+        self.assertIn("TOTAL Jito MEV tips  0.000080000 SOL  $0.01", out.getvalue())
+
+    def test_summary_keeps_tips_and_prio_fees_apart(self):
+        rows = [self.row(12345), self.row(678, income_type="jito_prio_fee")]
+        out = io.StringIO()
+        st.write_summary(out, st.Report(rows=rows), [STAKE], st.Period(), usd=False)
+        text = out.getvalue()
+        self.assertIn("TOTAL Jito MEV tips  0.000012345 SOL", text)
+        self.assertIn("TOTAL Jito priority fees  0.000000678 SOL", text)
+        self.assertIn("TOTAL Jito income (tips + priority fees)  0.000013023 SOL", text)
+        self.assertIn("SIMD-0123", text)
+
+    def test_summary_says_when_there_are_no_prio_fees(self):
+        out = io.StringIO()
+        report = st.Report(rows=[self.row(12345)])
+        st.write_summary(out, report, [STAKE], st.Period(), usd=False)
+        self.assertIn("Jito priority fees: none found", out.getvalue())
+
+    def test_csv_keeps_every_older_column_in_place(self):
+        for usd in (False, True):
+            out = io.StringIO()
+            st.write_csv(out, [], usd=usd)
+            old = st.CSV_FIELDS + (st.CSV_USD_FIELDS if usd else [])
+            header = out.getvalue().strip().split(",")
+            self.assertEqual(header, old + ["distribution_program"])
 
     def test_summary_totals_tips_only(self):
         other = self.row(300, income_type="other:validator_bonds")
@@ -1120,7 +1217,7 @@ class TestOutput(unittest.TestCase):
         out = io.StringIO()
         st.write_summary(out, report, [STAKE], st.Period(epoch=1085), usd=False)
         text = out.getvalue()
-        self.assertIn("TOTAL  0.000012345 SOL", text)
+        self.assertIn("TOTAL Jito MEV tips  0.000012345 SOL", text)
         self.assertIn("+0.000000300 SOL  other:validator_bonds", text)
 
 
@@ -1288,7 +1385,7 @@ class TestCli(unittest.TestCase):
                 with contextlib.redirect_stderr(io.StringIO()):
                     st.main(argv + ["--epoch", "1085", "--level", "summary", "--usd"])
         text = out.getvalue()
-        self.assertIn("TOTAL  0.000012345 SOL  $0.00", text)
+        self.assertIn("TOTAL Jito MEV tips  0.000012345 SOL  $0.00", text)
         self.assertIn("(1 claims)", text)
         self.assertNotIn("signature", text)  # no CSV header
 
@@ -1338,7 +1435,7 @@ class TestCli(unittest.TestCase):
             ):
                 st.main(argv)
             self.assertTrue(
-                out.read_text().splitlines()[1].endswith("jito_tip,tip-1085,,,")
+                out.read_text().splitlines()[1].endswith(f"jito_tip,tip-1085,,,,{TDP}")
             )
             # No price source is set (setUp clears it): no `prices` command.
             self.assertIn("No price source is set", err.getvalue())

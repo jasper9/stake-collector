@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Jito tip income for Solana stake accounts, kept in a local store.
+"""Jito income (MEV tips and priority fees) for Solana stake accounts, kept
+in a local store.
 
 Standalone: needs only Python 3.9+, `requests` and `python-dotenv`. See README.md.
 
@@ -79,8 +80,14 @@ STAKE_PROGRAM = "Stake11111111111111111111111111111111111111"
 SYSTEM_PROGRAM = "11111111111111111111111111111111"
 TIP_DISTRIBUTION_PROGRAM = "4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7"
 TIP_DISTRIBUTION_SEED = b"TIP_DISTRIBUTION_ACCOUNT"
-# Anchor event = sha256("event:ClaimedEvent")[:8], then tip_distribution_account,
-# payer, claimant (32 bytes each) and amount (u64 LE): 112 bytes.
+# Jito's Priority Fee Distribution program: validators that opt in share their
+# priority fees with stakers through it. Its claims mirror tip claims (Router
+# ClaimWithPayer, the same ClaimedEvent, a PDA per vote account and epoch).
+PRIO_FEE_DISTRIBUTION_PROGRAM = "Priority6weCZ5HwDn29NxLFpb7TDp2iLZ6XKc5e8d3"
+PRIO_FEE_DISTRIBUTION_SEED = b"PF_DISTRIBUTION_ACCOUNT"
+# Anchor event = sha256("event:ClaimedEvent")[:8], then the distribution account,
+# payer, claimant (32 bytes each) and amount (u64 LE): 112 bytes. Both Jito
+# programs log the same event, so the program that logged it decides the type.
 CLAIMED_EVENT_DISCRIMINATOR = hashlib.sha256(b"event:ClaimedEvent").digest()[:8]
 CLAIMED_EVENT_LEN = 112
 
@@ -89,7 +96,14 @@ STAKE_ACCOUNT_SIZE = 200
 STAKER_OFFSET = 12
 WITHDRAWER_OFFSET = 44
 
-INCOME_JITO_TIP = "jito_tip"
+INCOME_JITO_TIP = "jito_tip"  # MEV tips, from the Tip Distribution program
+INCOME_JITO_PRIO_FEE = "jito_prio_fee"  # priority fees, shared through Jito
+# The programs whose ClaimedEvent is income: program -> (PDA seed, income_type).
+JITO_CLAIM_PROGRAMS = {
+    TIP_DISTRIBUTION_PROGRAM: (TIP_DISTRIBUTION_SEED, INCOME_JITO_TIP),
+    PRIO_FEE_DISTRIBUTION_PROGRAM: (PRIO_FEE_DISTRIBUTION_SEED, INCOME_JITO_PRIO_FEE),
+}
+JITO_INCOME_TYPES = (INCOME_JITO_TIP, INCOME_JITO_PRIO_FEE)
 
 # Names for the programs behind an "other" balance increase. Unknown programs
 # are shown by their address.
@@ -98,6 +112,7 @@ KNOWN_PROGRAMS = {
     "mnspJQyF1KdDEs5c6YJPocYdY1esBgVQFufM2dY9oDk": "marinade_native",
     "RouterBmuRBkPUbgEDMtdvTZ75GBdSREZR5uGUxxxpb": "jito_router",
     TIP_DISTRIBUTION_PROGRAM: "jito_tip_distribution",
+    PRIO_FEE_DISTRIBUTION_PROGRAM: "jito_prio_fee_distribution",
     SYSTEM_PROGRAM: "system_transfer",
 }
 # Programs that never explain where the lamports came from.
@@ -183,14 +198,20 @@ def find_program_address(seeds, program_id):
     raise ValueError("no viable bump seed")
 
 
-def tip_distribution_account(vote_account, epoch):
-    """The Tip Distribution Account that holds a validator's tips for an epoch."""
+def distribution_account(program, vote_account, epoch):
+    """The account of a Jito claim program (JITO_CLAIM_PROGRAMS) that holds a
+    validator's tips or priority fees for an epoch."""
     seeds = [
-        TIP_DISTRIBUTION_SEED,
+        JITO_CLAIM_PROGRAMS[program][0],
         b58decode(vote_account),
         epoch.to_bytes(8, "little"),
     ]
-    return find_program_address(seeds, TIP_DISTRIBUTION_PROGRAM)[0]
+    return find_program_address(seeds, program)[0]
+
+
+def tip_distribution_account(vote_account, epoch):
+    """The Tip Distribution Account that holds a validator's tips for an epoch."""
+    return distribution_account(TIP_DISTRIBUTION_PROGRAM, vote_account, epoch)
 
 
 # ---------------------------------------------------------------------------
@@ -914,13 +935,20 @@ def sync_all(rpc, store, addresses, refresh, now):
 # ---------------------------------------------------------------------------
 @dataclass
 class Claim:
-    tip_distribution_account: str
+    tip_distribution_account: str  # the program's distribution account (PDA)
     claimant: str
     amount: int
+    program: str = TIP_DISTRIBUTION_PROGRAM  # the program that logged it
+
+    @property
+    def income_type(self):
+        return JITO_CLAIM_PROGRAMS[self.program][1]
 
 
 def decode_claim_events(log_messages):
-    """Every ClaimedEvent that the Tip Distribution program itself logged.
+    """Every ClaimedEvent that a Jito claim program (JITO_CLAIM_PROGRAMS)
+    itself logged, tagged with that program: the Tip Distribution program
+    (MEV tips) or the Priority Fee Distribution program (priority fees).
 
     The invoke stack is followed so that another program cannot fake a claim
     by logging the same bytes. Truncated logs lose the event: such a claim
@@ -940,7 +968,7 @@ def decode_claim_events(log_messages):
                 ):
                     stack.pop()
             continue
-        if not stack or stack[-1] != TIP_DISTRIBUTION_PROGRAM:
+        if not stack or stack[-1] not in JITO_CLAIM_PROGRAMS:
             continue
         try:
             data = base64.b64decode(line[len("Program data: ") :], validate=True)
@@ -953,6 +981,7 @@ def decode_claim_events(log_messages):
                 tip_distribution_account=b58encode(data[8:40]),
                 claimant=b58encode(data[72:104]),
                 amount=int.from_bytes(data[104:112], "little"),
+                program=stack[-1],
             )
         )
     return claims
@@ -1071,12 +1100,17 @@ class TxResult:
     """What one transaction did to one address."""
 
     delta: int  # balance change in lamports
-    tip: int = 0  # lamports claimed by this address as Jito tips
+    # Lamports this address claimed through Jito: tips and priority fees
+    # together (each Claim in `claims` says which).
+    tip: int = 0
     tip_accounts: list = field(default_factory=list)
     claims: list = field(default_factory=list)  # each Claim for this address
-    kind: str = "none"  # jito_tip | stake_program | other | none
+    kind: str = "none"  # jito_claim | stake_program | other | none
     label: str = ""  # for "other": the program(s) behind it
-    other: int = 0  # for a tip: lamports beyond the tip that nothing explains
+    other: int = 0  # for a claim: lamports beyond the claims that nothing explains
+
+
+KIND_JITO_CLAIM = "jito_claim"
 
 
 def classify(tx, address):
@@ -1099,7 +1133,7 @@ def classify(tx, address):
             tip=tip,
             tip_accounts=[c.tip_distribution_account for c in claims],
             claims=claims,
-            kind=INCOME_JITO_TIP,
+            kind=KIND_JITO_CLAIM,
             label=program_label(tx) if extra > 0 else "",
             other=max(extra, 0),
         )
@@ -1112,12 +1146,13 @@ def classify(tx, address):
     return TxResult(delta=unexplained, kind="other", label=program_label(tx))
 
 
-def match_tip_epoch(tip_account, voter, claim_epoch):
-    """The epoch whose tips `tip_account` held, if it belongs to `voter`."""
+def match_tip_epoch(tip_account, voter, claim_epoch, program=TIP_DISTRIBUTION_PROGRAM):
+    """The epoch whose tips (or priority fees, for the Priority Fee
+    Distribution program) `tip_account` held, if it belongs to `voter`."""
     if not voter:
         return None
     for epoch in range(claim_epoch, max(claim_epoch - TIP_EPOCH_LOOKBACK, 0) - 1, -1):
-        if tip_distribution_account(voter, epoch) == tip_account:
+        if distribution_account(program, voter, epoch) == tip_account:
             return epoch
     return None
 
@@ -1409,6 +1444,9 @@ class IncomeRow:
     signature: str
     usd_price: Decimal = None
     price_approximate: bool = False
+    # The program that logged the claim (empty for "other" rows), so any row
+    # can be checked on an explorer.
+    distribution_program: str = ""
 
 
 @dataclass
@@ -1445,10 +1483,12 @@ def usd_value(row, exact=False):
     return value.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
 
 
-def collect_jito_tips(rpc, store, addresses, period, schedule, refresh=False):
-    """Income source: Jito tip claims, read from the store (missing
-    transactions are fetched). Other sources (e.g. inflation rewards via
-    getInflationReward) can be added as functions with this signature."""
+def collect_jito_claims(rpc, store, addresses, period, schedule, refresh=False):
+    """Income source: Jito claims, read from the store (missing transactions
+    are fetched). Each row is one income type: jito_tip (MEV tips) or
+    jito_prio_fee (priority fees), by the program that logged the claim.
+    Other sources (e.g. inflation rewards via getInflationReward) can be
+    added as functions with this signature."""
     report = Report()
     now = int(time.time())
     for address in addresses:
@@ -1495,7 +1535,7 @@ def collect_jito_tips(rpc, store, addresses, period, schedule, refresh=False):
                         signature=signature,
                     )
                 )
-            if result.kind != INCOME_JITO_TIP:
+            if result.kind != KIND_JITO_CLAIM:
                 continue
             if result.tip != result.delta and not result.other:
                 report.tip_mismatches.append(
@@ -1506,15 +1546,22 @@ def collect_jito_tips(rpc, store, addresses, period, schedule, refresh=False):
                     voter = stake_voter(rpc, store, address, refresh, now) or ""
                 except OfflineError:
                     voter = ""
-            # One row per earned epoch: a transaction can claim several.
+            # One row per program and earned epoch: a transaction can claim
+            # several, and tips never share a row with priority fees.
             by_epoch = {}
             for claim in result.claims:
                 earned = match_tip_epoch(
-                    claim.tip_distribution_account, voter, claim_epoch
+                    claim.tip_distribution_account, voter, claim_epoch, claim.program
                 )
-                by_epoch[earned] = by_epoch.get(earned, 0) + claim.amount
-            for earned, lamports in sorted(
-                by_epoch.items(), key=lambda item: (item[0] is None, item[0] or 0)
+                key = (claim.program, earned)
+                by_epoch[key] = by_epoch.get(key, 0) + claim.amount
+            for (program, earned), lamports in sorted(
+                by_epoch.items(),
+                key=lambda item: (
+                    JITO_INCOME_TYPES.index(JITO_CLAIM_PROGRAMS[item[0][0]][1]),
+                    item[0][1] is None,
+                    item[0][1] or 0,
+                ),
             ):
                 report.rows.append(
                     IncomeRow(
@@ -1524,15 +1571,16 @@ def collect_jito_tips(rpc, store, addresses, period, schedule, refresh=False):
                         slot=slot,
                         block_time=when,
                         lamports=lamports,
-                        income_type=INCOME_JITO_TIP,
+                        income_type=JITO_CLAIM_PROGRAMS[program][1],
                         signature=signature,
+                        distribution_program=program,
                     )
                 )
         store.commit()
     return report
 
 
-INCOME_SOURCES = {INCOME_JITO_TIP: collect_jito_tips}
+INCOME_SOURCES = {"jito": collect_jito_claims}
 
 CSV_FIELDS = [
     "address",
@@ -1545,6 +1593,9 @@ CSV_FIELDS = [
     "signature",
 ]
 CSV_USD_FIELDS = ["sol_usd", "usd_value", "price_approximate"]
+# Added after the columns above (and after the USD columns), so a reader that
+# goes by column position still finds every older column where it was.
+CSV_TAIL_FIELDS = ["distribution_program"]
 
 
 def add_prices(rows, book, ticker="SOL"):
@@ -1563,7 +1614,7 @@ def add_prices(rows, book, ticker="SOL"):
 
 def write_csv(out, rows, usd):
     writer = csv.writer(out)
-    writer.writerow(CSV_FIELDS + (CSV_USD_FIELDS if usd else []))
+    writer.writerow(CSV_FIELDS + (CSV_USD_FIELDS if usd else []) + CSV_TAIL_FIELDS)
     for r in sorted(rows, key=lambda r: (r.address, r.slot)):
         line = [
             r.address,
@@ -1582,33 +1633,63 @@ def write_csv(out, rows, usd):
                 "" if value is None else str(value),
                 "yes" if r.price_approximate else "",
             ]
+        line.append(r.distribution_program)
         writer.writerow(line)
 
 
+# Summary sections: income_type, title, the program it comes from.
+SUMMARY_SECTIONS = (
+    (INCOME_JITO_TIP, "Jito MEV tips", "Tip Distribution program"),
+    (INCOME_JITO_PRIO_FEE, "Jito priority fees", "Priority Fee Distribution program"),
+)
+NOT_INCLUDED_NOTE = (
+    "# Not included: inflation (staking) rewards, and in-protocol block revenue"
+    " sharing (SIMD-0123). Both are paid with epoch rewards, not by a transaction."
+)
+
+
 def write_summary(out, report, addresses, period, usd):
-    print(f"# Jito tips, {period.label()}", file=out)
-    totals = {a: [0, Decimal(0), 0] for a in addresses}
-    for r in report.rows:
-        if r.income_type != INCOME_JITO_TIP:
-            continue  # --all-increases rows are listed below, not totalled
-        t = totals[r.address]
-        t[0] += r.lamports
-        t[2] += 1
-        value = usd_value(r, exact=True)
-        if value is not None:
-            t[1] += value
-    grand = sum(t[0] for t in totals.values())
-    for address, (lamports, dollars, count) in sorted(totals.items()):
-        extra = f"  ${dollars:,.2f}" if usd else ""
-        print(
-            f"{address}  {format_sol(lamports)} SOL  ({count} claims){extra}", file=out
-        )
-    extra = f"  ${sum(t[1] for t in totals.values()):,.2f}" if usd else ""
-    print(f"TOTAL  {format_sol(grand)} SOL{extra}", file=out)
+    def money(dollars):
+        return f"  ${dollars:,.2f}" if usd else ""
+
+    all_lamports, all_dollars = 0, Decimal(0)
+    for income_type, title, program in SUMMARY_SECTIONS:
+        print(f"# {title} ({program}), {period.label()}", file=out)
+        # --all-increases rows ("other:...") are listed below, not totalled.
+        rows = [r for r in report.rows if r.income_type == income_type]
+        if not rows and income_type != INCOME_JITO_TIP:
+            # Said, not left out: a missing section would look like an error.
+            print(f"{title}: none found for these addresses", file=out)
+            continue
+        totals = {a: [0, Decimal(0), 0] for a in addresses}
+        for r in rows:
+            t = totals[r.address]
+            t[0] += r.lamports
+            t[2] += 1
+            value = usd_value(r, exact=True)
+            if value is not None:
+                t[1] += value
+        for address, (lamports, dollars, count) in sorted(totals.items()):
+            print(
+                f"{address}  {format_sol(lamports)} SOL  ({count} claims)"
+                f"{money(dollars)}",
+                file=out,
+            )
+        lamports = sum(t[0] for t in totals.values())
+        dollars = sum((t[1] for t in totals.values()), Decimal(0))
+        print(f"TOTAL {title}  {format_sol(lamports)} SOL{money(dollars)}", file=out)
+        all_lamports += lamports
+        all_dollars += dollars
+    print(
+        f"TOTAL Jito income (tips + priority fees)  {format_sol(all_lamports)} SOL"
+        f"{money(all_dollars)}",
+        file=out,
+    )
+    print(NOT_INCLUDED_NOTE, file=out)
     missing = sum(
         1
         for r in report.rows
-        if usd and r.income_type == INCOME_JITO_TIP and r.usd_price is None
+        if usd and r.income_type in JITO_INCOME_TYPES and r.usd_price is None
     )
     if missing:
         print(
@@ -1617,7 +1698,7 @@ def write_summary(out, report, addresses, period, usd):
         )
     if report.other_increases:
         print(
-            "# Other transactions that increased a balance (not a Jito tip, not"
+            "# Other transactions that increased a balance (not a Jito claim, not"
             " the owner's own Stake Program moves). Check them: some can be income.",
             file=out,
         )
@@ -1637,7 +1718,7 @@ def write_summary(out, report, addresses, period, usd):
             print(f"{address}  {signature}  slot {slot}", file=out)
     for address, signature, tip, delta in report.tip_mismatches:
         print(
-            f"# NOTE {signature}: tip {format_sol(tip)} SOL but the balance of"
+            f"# NOTE {signature}: Jito claims {format_sol(tip)} SOL but the balance of"
             f" {address} changed by {format_sol(delta)} SOL",
             file=out,
         )
@@ -1708,7 +1789,8 @@ def parse_args(argv):
     )
 
     p = argparse.ArgumentParser(
-        description="Jito tip income for Solana stake accounts, kept in a local store."
+        description="Jito income (MEV tips and priority fees) for Solana stake accounts,"
+        " kept in a local store."
     )
     sub = p.add_subparsers(dest="command", required=True)
 

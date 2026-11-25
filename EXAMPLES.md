@@ -152,6 +152,16 @@ python stake_tips.py report --stakes my_stakes.txt --year 2025 --all-increases -
 python stake_tips.py report --stakes my_stakes.txt --year 2025 --all-increases --usd -o all_2025.csv
 ```
 
+### MEV tips and priority fees
+
+Every report has both. Each CSV row is one or the other (`income_type` = `jito_tip` or `jito_prio_fee`), and the summary has a section and a total for each, then the combined total. To keep only one type:
+
+```bash
+python stake_tips.py report --stakes my_stakes.txt --year 2025 -o jito_2025.csv
+grep -E '^address,|,jito_tip,' jito_2025.csv > tips_2025.csv
+grep -E '^address,|,jito_prio_fee,' jito_2025.csv > prio_fees_2025.csv
+```
+
 ### Offline and refresh
 
 ```bash

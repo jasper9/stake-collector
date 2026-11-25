@@ -1,9 +1,9 @@
-# stake_tips — Jito tip income for Solana stake accounts
+# stake_tips — Jito income for Solana stake accounts
 
 **For examples of every command and option, see [EXAMPLES.md](EXAMPLES.md).**
 **For AI agents that work on this tool, see [AGENTS.md](AGENTS.md).**
 
-`stake_tips.py` finds the Jito MEV tips that your stake accounts received. It keeps the chain data and the prices in a local store, and it makes CSV reports for tax from that store.
+`stake_tips.py` finds the Jito income that your stake accounts received: **MEV tips**, and **priority fees** that validators share through Jito. The two are always reported apart. It keeps the chain data and the prices in a local store, and it makes CSV reports for tax from that store.
 
 The tool is one file. It needs Python 3.9 or later, `requests` and `python-dotenv`. It does not need a Solana SDK.
 
@@ -125,25 +125,35 @@ python stake_tips.py report --stakes my_stakes.txt --year 2025 --usd --offline
 |--------|---------|---------|
 | `address` | `Stake1…` | The stake account. |
 | `epoch` | `1085` | The epoch of the claim transaction. |
-| `tip_epoch` | `1084` | The epoch in which the tips were **earned**. It is normally `epoch − 1`. It is empty when the tool cannot prove it (see Limits). |
+| `tip_epoch` | `1084` | The epoch in which the tips or priority fees were **earned**. It is normally `epoch − 1`. It is empty when the tool cannot prove it (see Limits). |
 | `slot` | `468750000` | The slot of the claim transaction. |
 | `blocktime` | `2026-11-13 03:20:00` | The block time, in UTC. |
-| `amount_sol` | `0.000012345` | The tip, in SOL, with 9 decimal places. |
-| `income_type` | `jito_tip` | `jito_tip`, or `other:<program>` with `--all-increases`. |
+| `amount_sol` | `0.000012345` | The amount claimed, in SOL, with 9 decimal places. |
+| `income_type` | `jito_tip` | `jito_tip` (Jito MEV tips), `jito_prio_fee` (priority fees shared through Jito), or `other:<program>` with `--all-increases`. |
 | `signature` | `4abc…` | The transaction signature. |
 | `sol_usd` | `80.00` | `--usd` only. The SOL/USD price at the nearest whole hour. |
 | `usd_value` | `0.000988` | `--usd` only. `amount_sol × sol_usd`, with 6 decimal places. |
 | `price_approximate` | `yes` | `--usd` only. `yes` when the nearest price point is more than 1 hour from that hour, or the price comes from webgator's database fallback. |
+| `distribution_program` | `4R3g…c2r7` | The Jito program that logged the claim: the Tip Distribution program for `jito_tip`, the Priority Fee Distribution program for `jito_prio_fee`. Empty for `other` rows. Use it to check a row on an explorer. |
+
+`distribution_program` is always the **last** column, after the `--usd` columns. Every older column keeps its position, so scripts that read the CSV by column position or by header still work.
 
 ### Summary
 
-- The total tips for each address, and the grand total. With `--usd`, the total USD too.
-- **Other balance increases.** This is a list of transactions that added SOL to a stake account and are not Jito tips or the owner's own Stake Program moves. Each one has a program label, for example `other:validator_bonds` (Marinade Validator Bonds settlements) or `other:system_transfer`. **Examine these transactions. Some of them can be income.**
+- **Jito MEV tips:** the total for each address, and `TOTAL Jito MEV tips`.
+- **Jito priority fees:** the same, with `TOTAL Jito priority fees`. If there are none, the summary says `none found` (most validators do not share priority fees).
+- `TOTAL Jito income (tips + priority fees)`. With `--usd`, every total has its USD value too.
+- A note that inflation rewards and SIMD-0123 block revenue are **not included** (see Limits).
+- **Other balance increases.** This is a list of transactions that added SOL to a stake account and are not Jito claims or the owner's own Stake Program moves. Each one has a program label, for example `other:validator_bonds` (Marinade Validator Bonds settlements) or `other:system_transfer`. **Examine these transactions. Some of them can be income.**
 
-## How a tip is found
+## How a tip or priority fee is found
 
-1. A tip is a Jito Tip Distribution `Claim`. The tool decodes the program's `ClaimedEvent` from the transaction logs. The event gives the claimant and the amount. The tool accepts the event only when the Tip Distribution program wrote it, so another program cannot make a false tip row.
-2. The event also gives the tip distribution account (TDA). A TDA address is derived from the validator's vote account and the epoch. The tool derives these addresses again to find `tip_epoch`.
+1. Jito pays stakers through two programs, each claimed through the Jito Router:
+   - **MEV tips:** the Tip Distribution program (`4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7`) → `jito_tip`.
+   - **Priority fees:** the Priority Fee Distribution program (`Priority6weCZ5HwDn29NxLFpb7TDp2iLZ6XKc5e8d3`) → `jito_prio_fee`. A validator opts in to share its priority fees this way.
+
+   Both programs log the same `ClaimedEvent`, which gives the claimant and the amount. The tool decodes it from the transaction logs, and **the program that logged it decides the type**. It accepts the event only when one of these two programs wrote it, so another program cannot make a false row.
+2. The event also gives the distribution account. Its address is derived from the validator's vote account and the epoch (seed `TIP_DISTRIBUTION_ACCOUNT` or `PF_DISTRIBUTION_ACCOUNT`). The tool derives these addresses again to find `tip_epoch`.
 3. These moves need the owner's authority on both accounts, so they are **not** income: Split, Merge, MoveLamports/MoveStake, and the CreateAccount that funds a new stake account. Only the part of a balance increase that these moves do not explain goes into the "other" list. A **Withdraw into** the account **from a different** stake account, or a plain transfer, can come from another party.
 
 ## Rate limits
@@ -172,4 +182,6 @@ Put these in `.env` next to `stake_tips.py` (copy `.env.example`). A variable th
 - **`tip_epoch` uses the stake account's delegation at its last lookup.** If the account was delegated to a different validator earlier, or if it is closed, `tip_epoch` is empty for those claims. `epoch`, `slot` and `blocktime` are always correct.
 - **Long logs can be truncated by the validator.** If the claim event is lost, the claim is shown as an "other" balance increase, not as a tip. It is not lost silently.
 - **Inflation (staking) rewards are not included.** The runtime pays them without a transaction. The code is ready for a second income source (`INCOME_SOURCES`), for example one that uses `getInflationReward`.
+- **In-protocol block revenue sharing (SIMD-0123) is not included.** It is not active on mainnet (2026-11). If it activates, it is paid with the epoch rewards, without a transaction, like inflation rewards. Priority fees shared **through Jito** are included (`jito_prio_fee`).
+- **Reports from earlier versions** listed priority fees shared through Jito as `other:jito_router`. They are now `jito_prio_fee`, with their own totals.
 - **This tool does not give tax advice.** Ask your tax adviser which time and price to use.

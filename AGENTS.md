@@ -8,7 +8,7 @@ All names below are exact identifiers in `stake_tips.py`. Line numbers change, s
 
 ## 1. What the tool does
 
-`stake_tips.py` finds the **Jito MEV tips** that Solana **stake accounts** received, and reports them as CSV and totals for tax. It keeps everything in a **local persistent store** (SQLite), so it grows over time and a repeat run makes no network calls.
+`stake_tips.py` finds the **Jito income** that Solana **stake accounts** received (**MEV tips**, `jito_tip`, and **priority fees shared through Jito**, `jito_prio_fee`, always kept apart), and reports them as CSV and totals for tax. It keeps everything in a **local persistent store** (SQLite), so it grows over time and a repeat run makes no network calls.
 
 - **Input:** stake account addresses (`--stakes FILE`), wallets (`--wallets FILE`, expanded to their stake accounts), and a period (`--epoch N`, `--year YYYY`, or all time).
 - **Output:** one CSV row per tip claim (and per earned epoch), totals per address, an optional USD value, and a review list of other balance increases.
@@ -19,7 +19,7 @@ All names below are exact identifiers in `stake_tips.py`. Line numbers change, s
 1. **Standalone.** The tool is one file. Its only dependencies are `requests` and `python-dotenv` (`requirements.txt`). Do not import a Solana SDK or anything else. The PDA and base58 code is pure Python on purpose.
 2. **Never print, log or store an RPC URL.** A URL can contain an API key (for example Helius `?api-key=`). `clusters.json` keys on `sha256(url)[:16]`. Error messages name the RPC method, never the URL.
 3. **Never commit or share `.env` or `data/`.** `.env` holds keys; `data/` (the store) lists the tracked addresses. `.gitignore` covers `.env`, `data/`, `*.sqlite3`, `*.csv` (reports hold addresses and income), `*.txt` except `requirements.txt` (address files) and `.venv/`. Never put a real address, signature or claim from your own accounts in the code, tests or docs: use made-up values.
-4. **A tip is only an event that the Tip Distribution program logged** (§6.1). Never trust a `Program data:` line from another program.
+4. **A Jito claim is only an event that a program in `JITO_CLAIM_PROGRAMS` logged** (§6.1), and **that program decides its `income_type`**. Both programs log the same `ClaimedEvent`, so never classify by the event bytes alone, and never trust a `Program data:` line from another program. Never mix tips and priority fees in one row or one total (except the labelled combined total).
 5. **Never drop income silently.** Anything that raised a balance and is not proven to be the owner's own money goes to the "other" list (§6.3). Anything that cannot be placed in a year is listed in the summary (`unknown_time`).
 6. **Never mark data as complete unless it is.** A sync position must not move past data that was not stored (`_walk_helius` raises on a bad answer). "No data" for a price is stored only after a valid answer (§7).
 7. **Prices are optional.** A price failure during a report is a warning, never a crash (`add_prices`). Reports are always complete in SOL.
@@ -62,7 +62,7 @@ main()
      ├─ cmd_sync    open_chain → resolve_addresses → load_epoch_schedule → sync_all
      ├─ cmd_prices  open_prices → make_price_source → PriceBook.backfill
      ├─ cmd_report  open_chain → resolve_addresses → ensure_synced (each address)
-     │              → INCOME_SOURCES (collect_jito_tips) → add_prices (if --usd)
+     │              → INCOME_SOURCES (collect_jito_claims) → add_prices (if --usd)
      │              → write_csv / write_summary
      └─ cmd_status  ChainStore.counts + PriceStore.coverage
 ```
@@ -77,16 +77,23 @@ Layers, from the bottom up:
 | Stores | `_Sqlite`, `ChainStore`, `PriceStore`, `StoreError`, `resolve_genesis`, `chain_store_path` |
 | Time | `EpochSchedule`, `load_epoch_schedule`, `year_bounds`, `Period` |
 | Sync | `_walk_standard`, `_walk_helius`, `sync_address`, `ensure_synced`, `fetch_transaction`, `stake_voter`, `wallet_stake_accounts`, `sync_all` |
-| Classification | `Claim`, `decode_claim_events`, `owner_moves_into`, `lamport_sources`, `stake_authorities_set`, `program_label`, `TxResult`, `classify`, `match_tip_epoch` |
+| Classification | `JITO_CLAIM_PROGRAMS`, `Claim`, `decode_claim_events`, `owner_moves_into`, `lamport_sources`, `stake_authorities_set`, `program_label`, `TxResult`, `KIND_JITO_CLAIM`, `classify`, `distribution_account`, `match_tip_epoch` |
 | Prices | `hour_of`, `nearest_points`, `NoPrices`, `WebgatorPrices`, `PriceBook`, `BackfillResult`, `make_price_source`, `PriceError` |
-| Report | `IncomeRow`, `Report`, `collect_jito_tips`, `INCOME_SOURCES`, `add_prices`, `usd_value`, `format_sol`, `format_time`, `write_csv`, `write_summary` |
+| Report | `IncomeRow`, `Report`, `collect_jito_claims`, `INCOME_SOURCES`, `add_prices`, `usd_value`, `format_sol`, `format_time`, `write_csv`, `write_summary` |
 | CLI | `read_address_file`, `parse_date`, `parse_args`, `open_chain`, `open_prices`, `resolve_addresses`, `cmd_*`, `COMMANDS`, `load_env_file`, `main` |
 
 ## 6. How income is found
 
-### 6.1 Jito tip claims
+### 6.1 Jito claims: MEV tips and priority fees
 
-On chain (checked on mainnet, 2026-11): a claim is a top-level Router `ClaimWithPayer` (`RouterBmuRBkPUbgEDMtdvTZ75GBdSREZR5uGUxxxpb`). It calls the Tip Distribution program (`TIP_DISTRIBUTION_PROGRAM` = `4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7`) `Claim` as an inner instruction. That program logs an Anchor **ClaimedEvent** in a `Program data: <base64>` line:
+On chain (checked on mainnet, 2026-11): a claim is a top-level Router `ClaimWithPayer` (`RouterBmuRBkPUbgEDMtdvTZ75GBdSREZR5uGUxxxpb`). It calls `Claim` of one of two programs as an inner instruction (`JITO_CLAIM_PROGRAMS`: program → (PDA seed, `income_type`)):
+
+| Program | Constant | Seed | income_type |
+|---------|----------|------|-------------|
+| Tip Distribution `4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7` | `TIP_DISTRIBUTION_PROGRAM` | `TIP_DISTRIBUTION_ACCOUNT` | `jito_tip` (`INCOME_JITO_TIP`) |
+| Priority Fee Distribution `Priority6weCZ5HwDn29NxLFpb7TDp2iLZ6XKc5e8d3` | `PRIO_FEE_DISTRIBUTION_PROGRAM` | `PF_DISTRIBUTION_ACCOUNT` | `jito_prio_fee` (`INCOME_JITO_PRIO_FEE`) |
+
+The priority-fee program is opt-in for validators (they share priority fees through Jito). In-protocol sharing (SIMD-0123) is a different thing: not active on mainnet (2026-11), and paid with epoch rewards, so a transaction scan cannot see it. Both programs log the same Anchor **ClaimedEvent** in a `Program data: <base64>` line:
 
 | Bytes | Field |
 |-------|-------|
@@ -96,11 +103,11 @@ On chain (checked on mainnet, 2026-11): a claim is a top-level Router `ClaimWith
 | 72–103 | claimant (the stake account) |
 | 104–111 | amount, u64 little-endian, lamports |
 
-`decode_claim_events(log_messages)` follows the invoke stack (`Program X invoke [n]` / `Program X success` / `Program X failed:`) and accepts a `Program data:` line only when the **top of the stack is the Tip Distribution program** and the data is exactly `CLAIMED_EVENT_LEN` (112) bytes with the right discriminator. If a validator truncates the logs, the event is lost; the claim then shows as an "other" increase (it is not lost silently).
+`decode_claim_events(log_messages)` follows the invoke stack (`Program X invoke [n]` / `Program X success` / `Program X failed:`) and accepts a `Program data:` line only when the **top of the stack is a program in `JITO_CLAIM_PROGRAMS`** (recorded as `Claim.program`; `Claim.income_type` follows from it) and the data is exactly `CLAIMED_EVENT_LEN` (112) bytes with the right discriminator. If a validator truncates the logs, the event is lost; the claim then shows as an "other" increase (it is not lost silently).
 
 ### 6.2 tip_epoch
 
-A TDA is a PDA: `find_program_address([TIP_DISTRIBUTION_SEED, vote_account, epoch.to_bytes(8, "little")], TIP_DISTRIBUTION_PROGRAM)`. `match_tip_epoch(tda, voter, claim_epoch)` derives it for `claim_epoch` down to `claim_epoch - TIP_EPOCH_LOOKBACK` and returns the epoch that matches, or `None`. The voter comes from `stake_voter` (the stake account's delegation, stored). Normally `tip_epoch = epoch - 1`. It is `None` if the account was delegated elsewhere earlier, or is closed. `collect_jito_tips` writes **one row per earned epoch** in a transaction (unmatched claims share a row with an empty `tip_epoch`).
+A distribution account is a PDA: `distribution_account(program, vote_account, epoch)` = `find_program_address([seed, vote_account, epoch.to_bytes(8, "little")], program)`, with the program's seed. `match_tip_epoch(account, voter, claim_epoch, program)` derives it for `claim_epoch` down to `claim_epoch - TIP_EPOCH_LOOKBACK` and returns the epoch that matches, or `None`. The voter comes from `stake_voter` (the stake account's delegation, stored). Normally `tip_epoch = epoch - 1`. It is `None` if the account was delegated elsewhere earlier, or is closed. Checked on mainnet for both programs: all sampled claims matched `epoch - 1`. `collect_jito_claims` writes **one row per program and earned epoch** in a transaction (a tip and a priority fee never share a row) (unmatched claims share a row with an empty `tip_epoch`).
 
 `is_on_curve` is the curve25519-dalek decompression check. A test compares `find_program_address` with `solders` when it is installed.
 
@@ -108,7 +115,7 @@ A TDA is a PDA: `find_program_address([TIP_DISTRIBUTION_SEED, vote_account, epoc
 
 `delta` = `postBalances - preBalances` of the address. Failed transactions and transactions without the address give `kind = "none"`.
 
-1. **Claims for this address exist** → `kind = "jito_tip"`, `tip` = sum of the claims. `other` = `delta - tip - owner_moves_into(...)` if positive (SOL that came with the claim), with `label`.
+1. **Claims for this address exist** → `kind = KIND_JITO_CLAIM` (`"jito_claim"`), `tip` = sum of the claims of both programs (each `Claim` keeps its program). `other` = `delta - tip - owner_moves_into(...)` if positive (SOL that came with the claim), with `label`.
 2. **`delta <= 0`** → `kind = "none"`.
 3. **`unexplained = delta - owner_moves_into(tx, address)`**. If `<= 0`, then `kind = "stake_program"` (the owner's own SOL). Else `kind = "other"`, `delta = unexplained`, `label = program_label(tx)`.
 
@@ -196,22 +203,22 @@ A price is keyed by the hour nearest the timestamp: `hour_of(ts)`.
 
 **Wallets** (`wallet_stake_accounts`): two `getProgramAccounts` calls on the Stake program, `dataSize` 200, `memcmp` at `WITHDRAWER_OFFSET` (44) and `STAKER_OFFSET` (12), `dataSlice` length 0. Only open accounts can be found.
 
-**Year filter without a time:** if a signature has no `blockTime`, `collect_jito_tips` reads the transaction, then `getBlockTime(slot)` (stored with `set_block_time`), else lists it in `Report.unknown_time`.
+**Year filter without a time:** if a signature has no `blockTime`, `collect_jito_claims` reads the transaction, then `getBlockTime(slot)` (stored with `set_block_time`), else lists it in `Report.unknown_time`.
 
 ## 10. Report output
 
-- `CSV_FIELDS`: address, epoch, tip_epoch, slot, blocktime (`YYYY-MM-DD HH:MM:SS` UTC), amount_sol (9 decimals, `format_sol`), income_type, signature. With `--usd`, `CSV_USD_FIELDS`: sol_usd, usd_value (6 decimals), price_approximate.
+- `CSV_FIELDS`: address, epoch, tip_epoch, slot, blocktime (`YYYY-MM-DD HH:MM:SS` UTC), amount_sol (9 decimals, `format_sol`), income_type, signature. With `--usd`, `CSV_USD_FIELDS`: sol_usd, usd_value (6 decimals), price_approximate. Then always `CSV_TAIL_FIELDS`: distribution_program (empty for `other` rows). **New columns go at the end** (`CSV_TAIL_FIELDS`), so old columns keep their positions.
 - Rows are sorted by address, then slot. `--all-increases` adds the "other" rows (`income_type` = `other:<label>`).
-- `write_summary`: totals per address and in total (tips only), USD totals from **unrounded** values (`usd_value(row, exact=True)`), the "other" list, `tip_mismatches`, `unknown_time`, and the hint for unpriced hours (`unpriced_hint`, printed by `cmd_report` after the summary).
+- `write_summary`: one section per `SUMMARY_SECTIONS` entry (Jito MEV tips, Jito priority fees), each with totals per address and `TOTAL <title>`; a priority-fee section with no rows says `none found`. Then `TOTAL Jito income (tips + priority fees)` and `NOT_INCLUDED_NOTE` (inflation, SIMD-0123). `other:` rows are never totalled. Also USD totals from **unrounded** values (`usd_value(row, exact=True)`), the "other" list, `tip_mismatches`, `unknown_time`, and the hint for unpriced hours (`unpriced_hint`, printed by `cmd_report` after the summary).
 - `--level summary`: totals only, to stdout. Else the CSV goes to `-o` or stdout, and the summary goes to stderr.
 - `--offline` with `--refresh` is refused.
 
 ## 11. How to extend
 
 **A new income type** (for example inflation rewards):
-1. Write `collect_<name>(rpc, store, addresses, period, schedule, refresh=False) -> Report` (the same signature as `collect_jito_tips`).
+1. Write `collect_<name>(rpc, store, addresses, period, schedule, refresh=False) -> Report` (the same signature as `collect_jito_claims`).
 2. Add it to `INCOME_SOURCES`.
-3. Give its rows their own `income_type`. `write_summary` totals only `INCOME_JITO_TIP` today, so add totals for the new type there.
+3. Give its rows their own `income_type`, and add a `SUMMARY_SECTIONS` entry for it (and to the combined total, if it belongs there).
 4. Store anything fetched (a new table, plus a migration, §8.2), so a rerun needs no RPC. Inflation rewards: `getInflationReward([addresses], {"epoch": N})`, one call per epoch for up to many addresses.
 
 **A new price source:** a class with `name`, `span_sec` (the seconds one call covers; 0 = one hour per call), a `calls` counter, and `fetch(ticker, start_hour, end_hour) -> {hour: (Decimal usd, bool approximate)}`. It must return `{}` for "no data" and raise `PriceError` for a bad answer (never treat a bad answer as no data). Wire it in `make_price_source` and in the `--price-source` choices.
@@ -250,4 +257,6 @@ A price is keyed by the hour nearest the timestamp: `hour_of(ts)`.
 | webgator `/range` (not `/at`) | `/at` is one upstream call per hour: about 8,760 calls (~77 min) for a year. `/range` is about 5 calls (~3 s). |
 | The prices are optional | Reports stay complete in SOL; prices can be added later with `prices` (a backfill that resumes). |
 | `tip_epoch` comes from the PDA, not from `epoch - 1` | Proved, not guessed. Empty when it cannot be proved. |
+| Jito priority fees are their own `income_type` (`jito_prio_fee`), not part of `jito_tip` | They are different income from a different program. The program that logged the `ClaimedEvent` decides the type; the event bytes are the same for both. |
+| New CSV columns go at the end | Backward compatibility: readers by position keep working. |
 | "Other" means unexplained, not "not Stake Program" | Validator Bonds pays settlements with a Stake `withdraw`; a simple program rule would hide that income. |
